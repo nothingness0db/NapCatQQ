@@ -1,0 +1,25 @@
+FROM mlikiowa/napcat-docker:latest
+
+RUN rm -rf \
+      /app/napcat/napcat.mjs \
+      /app/napcat/static \
+      /app/napcat/native \
+      /app/napcat/node_modules \
+      /app/napcat/worker \
+      /app/napcat/package.json \
+      /app/napcat/config \
+      /app/napcat/qqnt.json
+
+COPY . /app/napcat/
+
+# 基础镜像内置 QQ 3.2.34-53644；qqbackup 分支的 shell（1.0.0-dev）与它不兼容，
+# 登录服务不返回二维码。降级到分支完整支持的 3.2.32-52194。
+# deb 会覆盖 resources/app/package.json 的 main，导致 NapCat 注入失效，必须改回来。
+RUN dpkg -i --force-depends --force-overwrite --force-downgrade /app/napcat/qq.deb \
+ && rm -f /app/napcat/qq.deb \
+ && sed -i 's#"main": *".*"#"main": "./loadNapCat.js"#' /opt/QQ/resources/app/package.json \
+ && grep -q '"main": "./loadNapCat.js"' /opt/QQ/resources/app/package.json \
+ && grep -q '"version": "3.2.32-' /opt/QQ/resources/app/package.json \
+ && echo "QQ 3.2.32 + NapCat injection OK"
+
+RUN chown -R 1000:1000 /app/napcat

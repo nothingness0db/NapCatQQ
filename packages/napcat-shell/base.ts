@@ -170,6 +170,7 @@ async function handleLogin (
     WebUiDataRuntime.setQQLoginPhase('offline');
   };
   loginListener.onLoginConnected = () => {
+    logger.log('[Core] [Login] 登录服务已连接，等待网络...');
     waitForNetworkConnection(loginService, logger).then(async () => {
       if (!context.loginFlowInitialized) {
         context.loginFlowInitialized = true;
@@ -229,7 +230,19 @@ async function handleLogin (
   };
 
   loginService.addKernelLoginListener(proxiedListenerOf(loginListener, logger));
-  loginService.connect();
+  const connected = loginService.connect();
+  logger.log(`[Core] [Login] 登录服务 connect=${connected} msf=${loginService.getMsfStatus()}`);
+  // QQ 3.2.32 上 onLoginConnected 有时不回调，二维码就永远不生成。
+  // 5 秒内既没登录、也没拿到二维码时，主动请求一次（拿到后照常由过期事件刷新）。
+  setTimeout(() => {
+    if (context.isLogined || WebUiDataRuntime.getQQLoginQrcodeURL()) return;
+    try {
+      const requested = loginService.getQRCodePicture();
+      logger.logWarn(`[Core] [Login] 未收到 onLoginConnected，主动请求二维码: ${requested}`);
+    } catch (e) {
+      logger.logError('[Core] [Login] 主动请求二维码失败', e);
+    }
+  }, 5000);
   return await selfInfo;
 }
 async function handleLoginInner (context: { isLogined: boolean; loginFlowInitialized: boolean; }, logger: LogWrapper, loginService: NodeIKernelLoginService, quickLoginUin: string | undefined, historyLoginList: LoginListItem[]) {

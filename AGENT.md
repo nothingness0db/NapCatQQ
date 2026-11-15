@@ -1,6 +1,6 @@
 # AGENT.md
 
-自建 NapCat 的部署状态、改动记录与操作手册。最后更新：2026-11-15 12:30（CST）。
+自建 NapCat 的部署状态、改动记录与操作手册。最后更新：2026-11-15 21:30（CST）。
 
 ## 1. 背景
 
@@ -70,7 +70,7 @@ pnpm --filter napcat-plugin-builtin run build
 
 ### 3.2 镜像构建
 
-`packages/napcat-shell/dist/Dockerfile`：
+Dockerfile 模板在仓库的 `docker/Dockerfile.napcat-dist`（构建时由脚本复制到 `dist/Dockerfile`）：
 
 ```dockerfile
 FROM mlikiowa/napcat-docker:latest
@@ -78,10 +78,25 @@ RUN rm -rf /app/napcat/napcat.mjs /app/napcat/static /app/napcat/native \
            /app/napcat/node_modules /app/napcat/worker /app/napcat/package.json \
            /app/napcat/config /app/napcat/qqnt.json
 COPY . /app/napcat/
+RUN dpkg -i --force-depends --force-overwrite --force-downgrade /app/napcat/qq.deb \
+ && rm -f /app/napcat/qq.deb \
+ && sed -i 's#"main": *".*"#"main": "./loadNapCat.js"#' /opt/QQ/resources/app/package.json \
+ && grep -q '"main": "./loadNapCat.js"' /opt/QQ/resources/app/package.json \
+ && grep -q '"version": "3.2.32-' /opt/QQ/resources/app/package.json \
+ && echo "QQ 3.2.32 + NapCat injection OK"
 RUN chown -R 1000:1000 /app/napcat
 ```
 
-这样只替换 shell 代码，保留镜像里的 QQ、entrypoint、模板等。
+两条与「只替换 shell」不同的关键步骤，都是为了兼容本分支的 1.0.0-dev shell：
+
+1. **装 3.2.32 的 deb**：基础镜像里的 QQ 是 3.2.34-53644，该版本的登录服务与本 shell
+   不兼容（`connect()` 成功但永不回调、二维码不生成）。deb 来自
+   `/home/eria/napcat-debs/QQ_3.2.32_260812_amd64_01.deb`
+   （SHA256 `d085dd89397225061eb9f194308f688129818ed445777e97a4a0a16e13d7b0e8`，
+   源 `Rodert/qq-versions` 归档；官方 CDN 带签名链接已 404）。
+2. **改回 `main`**：装 deb 会把 `/opt/QQ/resources/app/package.json` 的 `main`
+   覆盖成 QQ 原生入口，QQ 能启动但 NapCat 不加载、6099 也不监听。`sed` 改回
+   `./loadNapCat.js`，并用 `grep` 校验版本和入口，写错了构建直接失败。
 
 ## 4. 本次改动记录
 
@@ -94,6 +109,28 @@ RUN chown -R 1000:1000 /app/napcat
 5. 容器于 2026-11-15 03:46 用新镜像重建；`napcat.mjs` 为本地构建版本
    （3,112,753 字节，含 `SelfOffline` 静默离线恢复逻辑）。
 
+### 4.1 2026-11-15 晚间（QQ 降版本）
+
+6. `packages/napcat-core/external/{packet,appid,napi2native}.json`：补 `3.2.34-53644-x64`
+   条目（来源 `XingYunStar/NapCatQQ` v4.18.42）。
+   packet `{"send":"CBF25A0","recv":"CBF60E0"}`、appid `537391664` /
+   `V1_LNX_NQ_3.2.34_53644_GW_B`、napi2native `{"send":"6E5AB20","recv":"3A12CD0"}`。
+   3.2.32 下不生效，留着以后升 3.2.34 用。
+7. `packages/napcat-shell/base.ts`：登录服务回退。QQ 3.2.32 上 `onLoginConnected`
+   偶发不回调（`connect()` 返回 true、MSF 在线），二维码永远不生成。现在注册监听后
+   起一个 5 秒定时器：既没登录也没 `qrcodeurl` 就主动调一次 `getQRCodePicture()`；
+   之后过期刷新仍走原有的 `ErrCode 3` 监听。
+8. `docker/Dockerfile.napcat-dist`：新的镜像模板（QQ deb 降版 + `main` 注入修复，
+   见 §3.2）。原来手写在 `dist/Dockerfile` 里，会被 `vite build` 清掉。
+9. `rebuild-napcat.sh`：重写。校验 deb SHA256 → 前端/shell/插件构建 → 把 Dockerfile
+   模板和 qq.deb 放回 `dist/` → `npm install --omit=dev` 用 `dist-package.json` →
+   `docker build` → 删掉 `dist/qq.deb`。新增 `BUILD_ONLY=1` 只打镜像、不重建容器
+   （当前没配快速登录，重建 = 必须重新扫码）。
+10. `/home/eria/data_disk/astrbot/ntqq/versions/config.json` 从 3.2.34 改成 3.2.32-52194
+    （备份 `config.json.bak-3.2.34-201039`）。
+
+回滚点：镜像 `napcat-custom:qqbackup-before53644-20261115`。
+
 ## 5. 运行状态与事件记录（2026-11-15）
 
 - `03:47` 容器启动，等待扫码。
@@ -105,20 +142,28 @@ RUN chown -R 1000:1000 /app/napcat
 日志里 `Login Error ErrType:1 ErrCode:3`（185 次）和二维码写入（188 次）
 是二维码每 2 分钟过期自动刷新，**不是掉线重连**。
 
+### 5.1 晚间事故与恢复（2026-11-15）
+
+- 白天起 NapCat 不可用：WebUI 起来了但从来没有二维码。排查发现基础镜像的 QQ
+  已被上游推到 3.2.34-53644，本分支 shell 与之不兼容（偏移表缺失只是第一层）。
+- `20:42` 补完偏移表 + 降 QQ 到 3.2.32 + 修 `main` 注入后重建，二维码恢复生成。
+- `20:51:08` 扫码但没在手机上点确认，`20:51:15` 报 `ErrCode 10`（二维码过期）。
+- `21:01:30` 重新扫码，`21:03:35` 登录成功；`21:03:31` AstrBot 的 OneBot 适配器已连上。
+- 结论：**二维码有效期约 2 分钟，扫完必须立刻在手机端点「确认登录」。**
+
 ## 6. 已知问题 / 待办
 
-1. **PacketBackend 版本表缺 QQ 3.2.34-53644**
-   - 现象：`[Core] [Packet] PacketBackend 不支持当前QQ版本架构：3.2.34-53644-x64`
-   - 原因：本分支基线是 2026-10-05，上游 2026-10-09 才补上 53644 的偏移表。
-   - 影响：底层发包能力被禁用，部分 OneBot 动作不可用。
-   - 修复：从 10-27 快照补 `packet.json` / `appid.json` / `napi2native.json`
-     中 `3.2.34-53644-x64` 的条目（`packet.json` 值为
-     `{"send":"CBF25A0","recv":"CBF60E0"}`），然后重建镜像。
+1. ~~**PacketBackend 版本表缺 QQ 3.2.34-53644**~~ **已修**（见 §4.1 第 6 条）。
+   但注意：补了偏移表不等于 3.2.34 能用——本分支 shell 的登录服务与 3.2.34 不兼容，
+   所以镜像仍固定在 3.2.32-52194。真要升 3.2.34，得先确认 shell 兼容性。
 2. **重启后需要重新扫码**
    - Docker entrypoint 只有设置 `ACCOUNT` 环境变量才会带 `-q` 快速登录。
    - 建议在 compose 的 napcat 环境变量里加 `ACCOUNT=<主账号QQ>`，
      降低掉线恢复后的扫码成本。
-3. 本地镜像 `napcat-custom:qqbackup` 只存在于本机，换机器部署需要重新构建。
+3. **`vite build` 会清空 `dist/`**
+   - `pnpm run build:shell` 会删掉 `dist/` 里手工放的东西（Dockerfile、qq.deb）。
+   - 现在由 `rebuild-napcat.sh` 在构建后自动放回，**不要再手写 `dist/Dockerfile`**。
+4. 本地镜像 `napcat-custom:qqbackup` 只存在于本机，换机器部署需要重新构建。
 
 ## 7. 操作手册
 
@@ -129,7 +174,12 @@ cd /home/eria/napcat-src
 # 修改源码...
 ./rebuild-napcat.sh          # 会自动 pull、构建、打镜像、docker compose up -d napcat
 SKIP_PULL=1 ./rebuild-napcat.sh   # 不想被 pull 覆盖本地改动时
+SKIP_PULL=1 BUILD_ONLY=1 ./rebuild-napcat.sh   # 只打镜像，不重建容器（不会让 QQ 掉线）
 ```
+
+> `rebuild-napcat.sh` 默认结尾会 `docker compose up -d napcat`，**容器重建 = QQ 掉线 =
+> 必须重新扫码**（没配 `ACCOUNT`）。只想更新镜像时加 `BUILD_ONLY=1`。
+> 二维码有效期约 2 分钟，扫完立刻在手机上点「确认登录」，否则 `ErrCode 10`。
 
 ### 回滚到官方镜像
 
